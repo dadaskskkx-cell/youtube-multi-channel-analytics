@@ -283,10 +283,13 @@ def make_public_report(data: pd.DataFrame) -> pd.DataFrame:
     preferred_columns = [
         "capture_time",
         "channel_title",
+        "alias",
         "subscriber_count",
         "estimated_revenue_total_usd",
         "views_48h",
         "api_period",
+        "status",
+        "error",
     ]
     existing_columns = [column for column in preferred_columns if column in public_data.columns]
     return public_data[existing_columns]

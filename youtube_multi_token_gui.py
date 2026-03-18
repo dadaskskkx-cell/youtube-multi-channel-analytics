@@ -240,9 +240,27 @@ class YouTubeManagerApp:
                 progress_callback=update_progress,
             )
             success_count = int((result["status"] == "成功").sum()) if not result.empty else 0
+            failed_count = len(result) - success_count
+
             self.root.after(0, lambda: self.progress_bar.config(value=0))
             self.root.after(0, lambda: self.log(f"采集完成：成功 {success_count} / 总计 {len(result)}"))
-            self.root.after(0, lambda: messagebox.showinfo("采集完成", f"已输出到：\n{Path(self.output_var.get().strip())}"))
+
+            # 显示失败频道列表
+            if failed_count > 0:
+                failed_rows = result[result["status"] != "成功"]
+                failed_list = []
+                for _, row in failed_rows.iterrows():
+                    channel = row.get("channel_title", "") or row.get("alias", "") or "未知频道"
+                    status = row.get("status", "未知错误")
+                    failed_list.append(f"• {channel} ({status})")
+
+                failed_msg = f"采集完成！\n\n成功：{success_count}\n失败：{failed_count}\n\n失败的频道：\n" + "\n".join(failed_list[:10])
+                if len(failed_list) > 10:
+                    failed_msg += f"\n... 还有 {len(failed_list) - 10} 个"
+
+                self.root.after(0, lambda: messagebox.showwarning("采集完成", failed_msg))
+            else:
+                self.root.after(0, lambda: messagebox.showinfo("采集完成", f"全部成功！\n已输出到：\n{Path(self.output_var.get().strip())}"))
 
         self.run_async(job, "正在批量采集数据...")
 
