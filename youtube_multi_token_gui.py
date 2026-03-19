@@ -84,13 +84,13 @@ class YouTubeManagerApp:
         ttk.Button(action_frame, text="打开输出文件", command=self.open_output).grid(row=1, column=6, padx=8, pady=8)
         ttk.Button(action_frame, text="打开注册表", command=self.open_registry).grid(row=1, column=7, padx=8, pady=8)
 
-        search_frame = ttk.Frame(container)
-        search_frame.pack(fill="x", pady=(10, 0))
-        ttk.Label(search_frame, text="搜索频道:").pack(side="left", padx=(0, 8))
-        ttk.Entry(search_frame, textvariable=self.search_var, width=40).pack(side="left")
-
         table_frame = ttk.LabelFrame(container, text="已授权频道")
         table_frame.pack(fill="both", expand=True, pady=(10, 0))
+
+        search_bar = ttk.Frame(table_frame)
+        search_bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
+        ttk.Label(search_bar, text="🔍 搜索:").pack(side="left", padx=(0, 8))
+        ttk.Entry(search_bar, textvariable=self.search_var, width=50).pack(side="left", fill="x", expand=True)
 
         columns = ("channel_title", "channel_id", "alias", "status", "updated_at")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
@@ -115,10 +115,10 @@ class YouTubeManagerApp:
         scrollbar_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         scrollbar_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar_y.grid(row=0, column=1, sticky="ns")
-        scrollbar_x.grid(row=1, column=0, sticky="ew")
-        table_frame.rowconfigure(0, weight=1)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        scrollbar_y.grid(row=1, column=1, sticky="ns")
+        scrollbar_x.grid(row=2, column=0, sticky="ew")
+        table_frame.rowconfigure(1, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
         log_frame = ttk.LabelFrame(container, text="日志")
