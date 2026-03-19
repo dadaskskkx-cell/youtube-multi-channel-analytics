@@ -461,12 +461,7 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
                     "error": exc.content.decode("utf-8", errors="ignore"),
                 }
             )
-            # 检查是否是token过期错误，如果是则自动标记为已停用
-            error_content = exc.content.decode("utf-8", errors="ignore")
-            if "invalid_grant" in error_content.lower() or "token has been expired" in error_content.lower():
-                _mark_channel_disabled(registry_path, channel_id)
         except Exception as exc:
-            error_str = repr(exc)
             rows.append(
                 {
                     "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -475,12 +470,9 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
                     "alias": alias,
                     "token_file": str(token_file),
                     "status": "错误",
-                    "error": error_str,
+                    "error": repr(exc),
                 }
             )
-            # 检查是否是token过期错误（RefreshError）
-            if "invalid_grant" in error_str.lower() or "token has been expired" in error_str.lower():
-                _mark_channel_disabled(registry_path, channel_id)
 
     result = pd.DataFrame(rows)
     if not result.empty:
@@ -489,30 +481,14 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
     return result
 
 
-def _mark_channel_disabled(registry_path: Path, channel_id: str) -> None:
-    """内部函数：自动标记频道为已停用（当检测到token过期时）"""
-    try:
-        registry = get_registry(registry_path)
-        if registry.empty:
-            return
-        mask = registry["channel_id"].astype(str) == str(channel_id)
-        if mask.any():
-            registry.loc[mask, "status"] = "已停用"
-            registry.loc[mask, "updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            write_table(registry_path, registry)
-    except Exception:
-        pass  # 静默失败，不影响采集流程
-
-
 def disable_channel(registry_path: Path, identifier: str, move_token: bool, inactive_dir: Path) -> Dict:
     registry = get_registry(registry_path)
     row = match_registry_row(registry, identifier)
     channel_id = row["channel_id"]
     token_file = Path(str(row["token_file"]))
 
-    # 修改状态为"已停用"而不是删除记录
-    registry.loc[registry["channel_id"].astype(str) == str(channel_id), "status"] = "已停用"
-    registry.loc[registry["channel_id"].astype(str) == str(channel_id), "updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 直接删除记录
+    registry = registry[registry["channel_id"].astype(str) != str(channel_id)]
 
     if move_token and token_file.exists():
         inactive_dir.mkdir(parents=True, exist_ok=True)
