@@ -80,7 +80,7 @@ class YouTubeManagerApp:
         ttk.Button(action_frame, text="生成中文报表", command=self.export_chinese).grid(row=0, column=7, padx=8, pady=8)
 
         ttk.Button(action_frame, text="删除选中频道", command=self.disable_selected).grid(row=1, column=4, padx=8, pady=8)
-        ttk.Button(action_frame, text="清理已停用频道", command=self.cleanup_disabled).grid(row=1, column=5, padx=8, pady=8)
+        ttk.Button(action_frame, text="清空所有频道", command=self.clear_all_channels).grid(row=1, column=5, padx=8, pady=8)
         ttk.Button(action_frame, text="打开输出文件", command=self.open_output).grid(row=1, column=6, padx=8, pady=8)
         ttk.Button(action_frame, text="打开注册表", command=self.open_registry).grid(row=1, column=7, padx=8, pady=8)
 
@@ -336,6 +336,28 @@ class YouTubeManagerApp:
             self.root.after(0, lambda: self.log(f"已删除：{result['channel_title']}"))
 
         self.run_async(job, "正在删除频道...")
+
+    def clear_all_channels(self) -> None:
+        if not messagebox.askyesno("确认", "确定要清空所有频道吗？\n这将删除所有已授权的频道！"):
+            return
+
+        if not messagebox.askyesno("再次确认", "此操作不可恢复！确定要继续吗？"):
+            return
+
+        def job() -> None:
+            from youtube_multi_token_manager import write_table, get_registry
+            registry_path = self._get_path_or_default(self.registry_var, "registry")
+            df = get_registry(registry_path)
+            count = len(df) if not df.empty else 0
+
+            # 清空注册表
+            write_table(registry_path, pd.DataFrame())
+
+            self.root.after(0, self.refresh_registry)
+            self.root.after(0, lambda: self.log(f"已清空 {count} 个频道"))
+            self.root.after(0, lambda: messagebox.showinfo("完成", f"已清空 {count} 个频道"))
+
+        self.run_async(job, "正在清空所有频道...")
 
     def cleanup_disabled(self) -> None:
         if not messagebox.askyesno("确认", "确定要清理所有已停用的频道吗？\n这将从注册表中永久删除这些记录。"):
