@@ -77,8 +77,9 @@ class YouTubeManagerApp:
         ttk.Button(action_frame, text="生成中文报表", command=self.export_chinese).grid(row=0, column=7, padx=8, pady=8)
 
         ttk.Button(action_frame, text="删除选中频道", command=self.disable_selected).grid(row=1, column=4, padx=8, pady=8)
-        ttk.Button(action_frame, text="打开输出文件", command=self.open_output).grid(row=1, column=5, padx=8, pady=8)
-        ttk.Button(action_frame, text="打开注册表", command=self.open_registry).grid(row=1, column=6, padx=8, pady=8)
+        ttk.Button(action_frame, text="清理已停用频道", command=self.cleanup_disabled).grid(row=1, column=5, padx=8, pady=8)
+        ttk.Button(action_frame, text="打开输出文件", command=self.open_output).grid(row=1, column=6, padx=8, pady=8)
+        ttk.Button(action_frame, text="打开注册表", command=self.open_registry).grid(row=1, column=7, padx=8, pady=8)
 
         table_frame = ttk.LabelFrame(container, text="已授权频道")
         table_frame.pack(fill="both", expand=True, pady=(10, 0))
@@ -210,17 +211,23 @@ class YouTubeManagerApp:
             return
 
         for _, row in df.iterrows():
-            self.tree.insert(
+            status = row.get("status", "")
+            item_id = self.tree.insert(
                 "",
                 "end",
                 values=(
                     row.get("channel_title", ""),
                     row.get("channel_id", ""),
                     row.get("alias", ""),
-                    row.get("status", ""),
+                    status,
                     row.get("updated_at", ""),
                 ),
             )
+            # 已停用的频道标记为灰色
+            if status == "已停用":
+                self.tree.item(item_id, tags=("disabled",))
+
+        self.tree.tag_configure("disabled", foreground="gray")
         self.log(f"已加载 {len(df)} 个频道。")
 
     def collect_data(self) -> None:
@@ -302,6 +309,32 @@ class YouTubeManagerApp:
             self.root.after(0, lambda: self.log(f"已删除：{result['channel_title']}"))
 
         self.run_async(job, "正在删除频道...")
+
+    def cleanup_disabled(self) -> None:
+        if not messagebox.askyesno("确认", "确定要清理所有已停用的频道吗？\n这将从注册表中永久删除这些记录。"):
+            return
+
+        def job() -> None:
+            registry_path = self._get_path_or_default(self.registry_var, "registry")
+            df = list_channels(registry_path)
+            disabled = df[df["status"] == "已停用"]
+
+            if disabled.empty:
+                self.root.after(0, lambda: self.log("没有已停用的频道需要清理"))
+                self.root.after(0, lambda: messagebox.showinfo("提示", "没有已停用的频道"))
+                return
+
+            # 删除已停用的记录
+            active = df[df["status"] != "已停用"]
+            from youtube_multi_token_manager import write_table
+            write_table(registry_path, active)
+
+            count = len(disabled)
+            self.root.after(0, self.refresh_registry)
+            self.root.after(0, lambda: self.log(f"已清理 {count} 个已停用频道"))
+            self.root.after(0, lambda: messagebox.showinfo("完成", f"已清理 {count} 个已停用频道"))
+
+        self.run_async(job, "正在清理已停用频道...")
 
     def open_output(self) -> None:
         path = Path(self.output_var.get().strip())

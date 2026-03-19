@@ -487,8 +487,9 @@ def disable_channel(registry_path: Path, identifier: str, move_token: bool, inac
     channel_id = row["channel_id"]
     token_file = Path(str(row["token_file"]))
 
-    # 直接删除记录
-    registry = registry[registry["channel_id"].astype(str) != str(channel_id)]
+    # 修改状态为"已停用"而不是删除记录
+    registry.loc[registry["channel_id"].astype(str) == str(channel_id), "status"] = "已停用"
+    registry.loc[registry["channel_id"].astype(str) == str(channel_id), "updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if move_token and token_file.exists():
         inactive_dir.mkdir(parents=True, exist_ok=True)
