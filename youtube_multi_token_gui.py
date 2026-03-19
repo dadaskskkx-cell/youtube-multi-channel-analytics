@@ -43,6 +43,9 @@ class YouTubeManagerApp:
         self.alias_var = tk.StringVar()
         self.port_var = tk.StringVar(value="8768")
         self.status_var = tk.StringVar(value="就绪")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *args: self.filter_channels())
+        self.full_registry = pd.DataFrame()  # 存储完整的频道列表
 
         self.tree: ttk.Treeview
         self.log_text: tk.Text
@@ -80,6 +83,11 @@ class YouTubeManagerApp:
         ttk.Button(action_frame, text="清理已停用频道", command=self.cleanup_disabled).grid(row=1, column=5, padx=8, pady=8)
         ttk.Button(action_frame, text="打开输出文件", command=self.open_output).grid(row=1, column=6, padx=8, pady=8)
         ttk.Button(action_frame, text="打开注册表", command=self.open_registry).grid(row=1, column=7, padx=8, pady=8)
+
+        search_frame = ttk.Frame(container)
+        search_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(search_frame, text="搜索频道:").pack(side="left", padx=(0, 8))
+        ttk.Entry(search_frame, textvariable=self.search_var, width=40).pack(side="left")
 
         table_frame = ttk.LabelFrame(container, text="已授权频道")
         table_frame.pack(fill="both", expand=True, pady=(10, 0))
@@ -199,16 +207,36 @@ class YouTubeManagerApp:
 
     def refresh_registry(self) -> None:
         try:
-            df = list_channels(self._get_path_or_default(self.registry_var, "registry"))
+            self.full_registry = list_channels(self._get_path_or_default(self.registry_var, "registry"))
         except Exception as exc:
             self.log(f"读取注册表失败：{exc}")
             return
 
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        if df.empty:
+        if self.full_registry.empty:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
             self.log("当前还没有已授权频道。")
             return
+
+        self.filter_channels()
+        self.log(f"已加载 {len(self.full_registry)} 个频道。")
+
+    def filter_channels(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        if self.full_registry.empty:
+            return
+
+        search_text = self.search_var.get().strip().lower()
+        df = self.full_registry
+
+        if search_text:
+            df = df[
+                df["channel_title"].astype(str).str.lower().str.contains(search_text, na=False) |
+                df["alias"].astype(str).str.lower().str.contains(search_text, na=False) |
+                df["channel_id"].astype(str).str.lower().str.contains(search_text, na=False)
+            ]
 
         for _, row in df.iterrows():
             status = row.get("status", "")
@@ -223,12 +251,10 @@ class YouTubeManagerApp:
                     row.get("updated_at", ""),
                 ),
             )
-            # 已停用的频道标记为灰色
             if status == "已停用":
                 self.tree.item(item_id, tags=("disabled",))
 
         self.tree.tag_configure("disabled", foreground="gray")
-        self.log(f"已加载 {len(df)} 个频道。")
 
     def collect_data(self) -> None:
         def job() -> None:
