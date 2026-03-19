@@ -461,7 +461,12 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
                     "error": exc.content.decode("utf-8", errors="ignore"),
                 }
             )
+            # 检查是否是token过期错误，如果是则自动标记为已停用
+            error_content = exc.content.decode("utf-8", errors="ignore")
+            if "invalid_grant" in error_content.lower() or "token has been expired" in error_content.lower():
+                _mark_channel_disabled(registry_path, channel_id)
         except Exception as exc:
+            error_str = repr(exc)
             rows.append(
                 {
                     "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -470,15 +475,33 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
                     "alias": alias,
                     "token_file": str(token_file),
                     "status": "错误",
-                    "error": repr(exc),
+                    "error": error_str,
                 }
             )
+            # 检查是否是token过期错误（RefreshError）
+            if "invalid_grant" in error_str.lower() or "token has been expired" in error_str.lower():
+                _mark_channel_disabled(registry_path, channel_id)
 
     result = pd.DataFrame(rows)
     if not result.empty:
         result = result.sort_values(by=["status", "channel_title"], ascending=[True, True])
     write_table(output_path, make_public_report(result))
     return result
+
+
+def _mark_channel_disabled(registry_path: Path, channel_id: str) -> None:
+    """内部函数：自动标记频道为已停用（当检测到token过期时）"""
+    try:
+        registry = get_registry(registry_path)
+        if registry.empty:
+            return
+        mask = registry["channel_id"].astype(str) == str(channel_id)
+        if mask.any():
+            registry.loc[mask, "status"] = "已停用"
+            registry.loc[mask, "updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            write_table(registry_path, registry)
+    except Exception:
+        pass  # 静默失败，不影响采集流程
 
 
 def disable_channel(registry_path: Path, identifier: str, move_token: bool, inactive_dir: Path) -> Dict:
