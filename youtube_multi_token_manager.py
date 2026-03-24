@@ -11,33 +11,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
-from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient import _auth
-from requests.exceptions import RequestException
-
-# 设置代理
-def setup_proxy():
-    """从环境变量读取代理设置"""
-    http_proxy = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
-    https_proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
-
-    if http_proxy or https_proxy:
-        proxy_dict = {}
-        if https_proxy:
-            proxy_dict['https'] = https_proxy
-        if http_proxy:
-            proxy_dict['http'] = http_proxy
-
-        # 为googleapiclient设置代理
-        _auth.httplib22.Http._auth_dynamic_proxy = proxy_dict.get('https') or proxy_dict.get('http')
-
-# 初始化时设置代理
-setup_proxy()
 
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.readonly",
@@ -55,17 +33,21 @@ def get_default_paths() -> Dict[str, Path]:
 
     # 如果是打包后的exe，数据保存到用户目录
     if getattr(sys, 'frozen', False):
-        bundle_dir = Path(sys._MEIPASS)
+        # exe 所在目录
+        exe_dir = Path(sys.executable).parent
+
+        # 优先从 exe 同目录读取 client_secrets.json
+        exe_client_secrets = exe_dir / "client_secrets.json"
 
         # 确保用户目录存在
         root.mkdir(parents=True, exist_ok=True)
         (root / "tokens").mkdir(exist_ok=True)
 
-        # 首次运行时，复制client_secrets
-        client_secrets = root / "client_secrets.json"
-        if not client_secrets.exists():
-            import shutil
-            shutil.copy2(bundle_dir / "client_secrets.json", client_secrets)
+        # 如果 exe 同目录有配置文件，使用它；否则使用用户目录的
+        if exe_client_secrets.exists():
+            client_secrets = exe_client_secrets
+        else:
+            client_secrets = root / "client_secrets.json"
 
         # 检查注册表文件
         registry = root / "authorized_channels.xlsx"
@@ -128,18 +110,7 @@ def load_credentials(client_secrets: Path, token_file: Path, force_reauth: bool,
             creds = pickle.load(file_obj)
 
     if creds and creds.expired and creds.refresh_token:
-        # 设置代理
-        proxies = {}
-        for key in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
-            if key in os.environ:
-                proxies['https'] = os.environ.get('https_proxy') or os.environ.get('HTTPS_PROXY')
-                proxies['http'] = os.environ.get('http_proxy') or os.environ.get('HTTP_PROXY')
-                break
-
-        request = Request()
-        if proxies:
-            request.session.proxies = proxies
-        creds.refresh(request)
+        creds.refresh(Request())
         with token_file.open("wb") as file_obj:
             pickle.dump(creds, file_obj)
         return creds
@@ -148,32 +119,17 @@ def load_credentials(client_secrets: Path, token_file: Path, force_reauth: bool,
         return creds
 
     flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets), SCOPES)
-
-    # 尝试多个端口
-    ports_to_try = [port, 8080, 8090, 8888, 9000]
-    last_error = None
-
-    for try_port in ports_to_try:
-        try:
-            print(f"\n尝试使用端口 {try_port} 进行授权...")
-            creds = flow.run_local_server(
-                host="127.0.0.1",
-                port=try_port,
-                authorization_prompt_message=f"请在浏览器完成授权（端口{try_port}），完成后会自动返回。",
-                success_message="授权完成，可以关闭此页面。",
-                open_browser=True,
-                access_type="offline",
-                prompt="consent",
-                include_granted_scopes="true",
-            )
-            print(f"授权成功！使用端口 {try_port}")
-            break
-        except Exception as e:
-            last_error = e
-            print(f"端口 {try_port} 失败: {e}")
-            if try_port == ports_to_try[-1]:
-                raise Exception(f"所有端口都失败了。最后错误: {last_error}")
-            continue
+    creds = flow.run_local_server(
+        host="localhost",
+        port=port,
+        authorization_prompt_message="请在浏览器完成当前频道的 Google 授权，完成后会自动返回。",
+        success_message="授权完成，可以回到终端。",
+        open_browser=True,
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+        timeout_seconds=300,
+    )
 
     ensure_parent(token_file)
     with token_file.open("wb") as file_obj:
@@ -327,10 +283,13 @@ def make_public_report(data: pd.DataFrame) -> pd.DataFrame:
     preferred_columns = [
         "capture_time",
         "channel_title",
+        "alias",
         "subscriber_count",
         "estimated_revenue_total_usd",
         "views_48h",
         "api_period",
+        "status",
+        "error",
     ]
     existing_columns = [column for column in preferred_columns if column in public_data.columns]
     return public_data[existing_columns]
@@ -453,65 +412,13 @@ def collect_one_channel(client_secrets: Path, token_file: Path) -> Dict:
     }
 
 
-def collect_one_channel_safe(client_secrets: Path, token_file: Path) -> Dict:
-    fallback_channel = {
-        "channel_id": "",
-        "channel_title": token_file.stem.split("__")[0],
-        "custom_url": "",
-        "subscriber_count": 0,
-        "video_count": 0,
-        "total_view_count": 0,
-    }
-    try:
-        return collect_one_channel(client_secrets, token_file)
-    except RefreshError as exc:
-        return {
-            "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            **fallback_channel,
-            "period_start": "",
-            "period_end": "",
-            "views_28d": 0,
-            "watch_hours_28d": 0.0,
-            "estimated_revenue_28d_usd": 0.0,
-            "estimated_revenue_total_usd": 0.0,
-            "playback_based_cpm_28d_usd": 0.0,
-            "rpm_28d_usd": 0.0,
-            "views_48h": 0,
-            "token_file": str(token_file),
-            "status": "令牌失效",
-            "error": str(exc),
-        }
-    except (TimeoutError, OSError, RequestException) as exc:
-        return {
-            "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            **fallback_channel,
-            "period_start": "",
-            "period_end": "",
-            "views_28d": 0,
-            "watch_hours_28d": 0.0,
-            "estimated_revenue_28d_usd": 0.0,
-            "estimated_revenue_total_usd": 0.0,
-            "playback_based_cpm_28d_usd": 0.0,
-            "rpm_28d_usd": 0.0,
-            "views_48h": 0,
-            "token_file": str(token_file),
-            "status": "网络超时",
-            "error": repr(exc),
-        }
-
-
 def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: Path, output_path: Path, progress_callback=None) -> pd.DataFrame:
     rows: List[Dict] = []
     registry = get_registry(registry_path)
 
     if registry.empty:
-        # 返回空的DataFrame，但包含所有必需的列
-        empty_df = pd.DataFrame(columns=[
-            "capture_time", "channel_title", "subscriber_count",
-            "estimated_revenue_total_usd", "views_48h", "api_period"
-        ])
-        write_table(output_path, empty_df)
-        return empty_df
+        write_table(output_path, pd.DataFrame())
+        return pd.DataFrame()
 
     active_registry = registry[registry["status"].fillna("").astype(str) == "已授权"].copy()
     token_files = [Path(value) for value in active_registry["token_file"].tolist() if str(value).strip()]
@@ -520,12 +427,20 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
     for idx, token_file in enumerate(token_files, 1):
         if progress_callback:
             progress_callback(idx, total)
+
+        # 从注册表获取频道基本信息
+        channel_info = active_registry[active_registry["token_file"] == str(token_file)]
+        channel_title = channel_info["channel_title"].iloc[0] if not channel_info.empty else ""
+        channel_id = channel_info["channel_id"].iloc[0] if not channel_info.empty else ""
+        alias = channel_info["alias"].iloc[0] if not channel_info.empty else ""
+
         if token_file.name.startswith("_pending_") or not token_file.exists():
             rows.append(
                 {
                     "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "channel_title": "",
-                    "channel_id": "",
+                    "channel_title": channel_title,
+                    "channel_id": channel_id,
+                    "alias": alias,
                     "token_file": str(token_file),
                     "status": "令牌缺失",
                     "error": "token file not found",
@@ -533,13 +448,14 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
             )
             continue
         try:
-            rows.append(collect_one_channel_safe(client_secrets, token_file))
+            rows.append(collect_one_channel(client_secrets, token_file))
         except HttpError as exc:
             rows.append(
                 {
                     "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "channel_title": "",
-                    "channel_id": "",
+                    "channel_title": channel_title,
+                    "channel_id": channel_id,
+                    "alias": alias,
                     "token_file": str(token_file),
                     "status": "http_error",
                     "error": exc.content.decode("utf-8", errors="ignore"),
@@ -549,8 +465,9 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
             rows.append(
                 {
                     "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "channel_title": "",
-                    "channel_id": "",
+                    "channel_title": channel_title,
+                    "channel_id": channel_id,
+                    "alias": alias,
                     "token_file": str(token_file),
                     "status": "错误",
                     "error": repr(exc),

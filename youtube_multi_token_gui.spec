@@ -5,7 +5,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('C:/Users/北笙/youtube-analytics/client_secrets.json', '.'),
+        ('使用说明.md', '.'),
     ],
     hiddenimports=[
         'youtube_multi_token_manager',
