@@ -6,6 +6,7 @@ import os
 import pickle
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -17,11 +18,16 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-SCOPES = [
+BASE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.readonly",
     "https://www.googleapis.com/auth/yt-analytics.readonly",
-    "https://www.googleapis.com/auth/yt-analytics-monetary.readonly",
 ]
+REVENUE_SCOPE = "https://www.googleapis.com/auth/yt-analytics-monetary.readonly"
+SCOPE_PROFILES = {
+    "basic": BASE_SCOPES,
+    "revenue": [*BASE_SCOPES, REVENUE_SCOPE],
+}
+DEFAULT_SCOPE_PROFILE = "basic"
 ANALYTICS_LAG_DAYS = 3
 
 
@@ -35,19 +41,26 @@ def get_default_paths() -> Dict[str, Path]:
     if getattr(sys, 'frozen', False):
         # exe 所在目录
         exe_dir = Path(sys.executable).parent
+        bundle_dir = Path(getattr(sys, "_MEIPASS", exe_dir))
 
         # 优先从 exe 同目录读取 client_secrets.json
         exe_client_secrets = exe_dir / "client_secrets.json"
+        bundled_client_secrets = bundle_dir / "client_secrets.json"
 
         # 确保用户目录存在
         root.mkdir(parents=True, exist_ok=True)
         (root / "tokens").mkdir(exist_ok=True)
 
         # 如果 exe 同目录有配置文件，使用它；否则使用用户目录的
+        user_client_secrets = root / "client_secrets.json"
+        if not user_client_secrets.exists() and bundled_client_secrets.exists():
+            import shutil
+            shutil.copy2(bundled_client_secrets, user_client_secrets)
+
         if exe_client_secrets.exists():
             client_secrets = exe_client_secrets
         else:
-            client_secrets = root / "client_secrets.json"
+            client_secrets = user_client_secrets
 
         # 检查注册表文件
         registry = root / "authorized_channels.xlsx"
@@ -58,7 +71,7 @@ def get_default_paths() -> Dict[str, Path]:
 
         if not registry.exists() or not has_tokens:
             import pandas as pd
-            empty_df = pd.DataFrame(columns=['updated_at', 'alias', 'channel_title', 'channel_id', 'custom_url', 'token_file', 'status'])
+            empty_df = pd.DataFrame(columns=['updated_at', 'alias', 'channel_title', 'channel_id', 'custom_url', 'token_file', 'scope_profile', 'status'])
             empty_df.to_excel(registry, index=False)
     else:
         client_secrets = root / "client_secrets.json"
@@ -99,8 +112,40 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def load_credentials(client_secrets: Path, token_file: Path, force_reauth: bool, port: int) -> Credentials:
+def normalize_scope_profile(scope_profile: Optional[str]) -> str:
+    profile = (scope_profile or "").strip().lower()
+    return profile if profile in SCOPE_PROFILES else DEFAULT_SCOPE_PROFILE
+
+
+def get_scopes(scope_profile: Optional[str]) -> List[str]:
+    return list(SCOPE_PROFILES[normalize_scope_profile(scope_profile)])
+
+
+def has_scope(creds: Credentials, scope: str) -> bool:
+    return scope in set(creds.scopes or [])
+
+
+def build_auth_blocked_message(scope_profile: str) -> str:
+    current_scopes = ", ".join(get_scopes(scope_profile))
+    return (
+        "Google blocked this OAuth authorization. "
+        "Check the Google Cloud Console OAuth consent screen and verify that the app is configured correctly. "
+        "Use Production mode or add the target account as a test user. "
+        f"Current scope profile: {scope_profile} ({current_scopes}). "
+        "If revenue authorization is blocked for new accounts, retry with the basic profile first."
+    )
+
+
+def load_credentials(
+    client_secrets: Path,
+    token_file: Path,
+    force_reauth: bool,
+    port: int,
+    scope_profile: Optional[str] = None,
+) -> Credentials:
     creds: Optional[Credentials] = None
+    scope_profile = normalize_scope_profile(scope_profile)
+    requested_scopes = get_scopes(scope_profile)
 
     if force_reauth and token_file.exists():
         token_file.unlink()
@@ -110,26 +155,70 @@ def load_credentials(client_secrets: Path, token_file: Path, force_reauth: bool,
             creds = pickle.load(file_obj)
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with token_file.open("wb") as file_obj:
-            pickle.dump(creds, file_obj)
-        return creds
+        # SSL错误时重试3次
+        for retry in range(3):
+            try:
+                proxies = {}
+                for key in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
+                    if key in os.environ:
+                        proxies['https'] = os.environ.get('https_proxy') or os.environ.get('HTTPS_PROXY')
+                        proxies['http'] = os.environ.get('http_proxy') or os.environ.get('HTTP_PROXY')
+                        break
+
+                request = Request()
+                if proxies:
+                    request.session.proxies = proxies
+                creds.refresh(request)
+                with token_file.open("wb") as file_obj:
+                    pickle.dump(creds, file_obj)
+                return creds
+            except Exception as e:
+                if retry == 2:
+                    raise
+                continue
 
     if creds and creds.valid:
         return creds
 
-    flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets), SCOPES)
-    creds = flow.run_local_server(
-        host="localhost",
-        port=port,
-        authorization_prompt_message="请在浏览器完成当前频道的 Google 授权，完成后会自动返回。",
-        success_message="授权完成，可以回到终端。",
-        open_browser=True,
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes="true",
-        timeout_seconds=300,
-    )
+    flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets), requested_scopes)
+    ports_to_try = []
+    for candidate in [port, 9000, 8768, 8769, 8770, 8888, 9001]:
+        if candidate not in ports_to_try:
+            ports_to_try.append(candidate)
+
+    last_exc: Optional[Exception] = None
+    creds = None
+    for try_port in ports_to_try:
+        try:
+            creds = flow.run_local_server(
+                host="localhost",
+                port=try_port,
+                authorization_prompt_message="Please finish Google authorization in the browser window.",
+                success_message="Authorization completed. You can close this page.",
+                open_browser=True,
+                access_type="offline",
+                prompt="consent",
+                include_granted_scopes="true",
+                timeout_seconds=300,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            error_text = str(exc).lower()
+            auth_blocked_markers = [
+                "access blocked",
+                "app is blocked",
+                "invalid_request",
+                "this app is blocked",
+                "此应用已被阻止",
+                "google 阻止了此次访问",
+            ]
+            if any(marker in error_text for marker in auth_blocked_markers):
+                raise RuntimeError(build_auth_blocked_message(scope_profile)) from exc
+            continue
+
+    if last_exc is not None and creds is None:
+        raise last_exc
 
     ensure_parent(token_file)
     with token_file.open("wb") as file_obj:
@@ -169,20 +258,24 @@ def get_current_channel(youtube) -> Dict:
     }
 
 
-def get_analytics_summary(analytics) -> Dict:
+def get_analytics_summary(analytics, include_revenue: bool = True) -> Dict:
     start_date, end_date = get_analytics_window(days=28)
     # 获取总收入（从2005-01-01至今）
-    response_total = (
-        analytics.reports()
-        .query(
-            ids="channel==MINE",
-            startDate="2005-01-01",
-            endDate=end_date.isoformat(),
-            metrics="estimatedRevenue",
+    total_revenue = 0.0
+    metrics = "views,estimatedMinutesWatched"
+    if include_revenue:
+        response_total = (
+            analytics.reports()
+            .query(
+                ids="channel==MINE",
+                startDate="2005-01-01",
+                endDate=end_date.isoformat(),
+                metrics="estimatedRevenue",
+            )
+            .execute()
         )
-        .execute()
-    )
-    total_revenue = float(response_total.get("rows", [[0]])[0][0] or 0) if response_total.get("rows") else 0.0
+        total_revenue = float(response_total.get("rows", [[0]])[0][0] or 0) if response_total.get("rows") else 0.0
+        metrics = "views,estimatedMinutesWatched,estimatedRevenue,playbackBasedCpm,monetizedPlaybacks"
 
     # 获取28天数据
     response = (
@@ -191,7 +284,7 @@ def get_analytics_summary(analytics) -> Dict:
             ids="channel==MINE",
             startDate=start_date.isoformat(),
             endDate=end_date.isoformat(),
-            metrics="views,estimatedMinutesWatched,estimatedRevenue,playbackBasedCpm,monetizedPlaybacks",
+            metrics=metrics,
         )
         .execute()
     )
@@ -199,9 +292,9 @@ def get_analytics_summary(analytics) -> Dict:
     rows = response.get("rows", [])
     views = int(rows[0][0] or 0) if rows else 0
     watched_minutes = float(rows[0][1] or 0) if rows else 0.0
-    revenue = float(rows[0][2] or 0) if rows else 0.0
-    playback_based_cpm = float(rows[0][3] or 0) if rows else 0.0
-    monetized_playbacks = int(rows[0][4] or 0) if rows and len(rows[0]) > 4 else 0
+    revenue = float(rows[0][2] or 0) if include_revenue and rows and len(rows[0]) > 2 else 0.0
+    playback_based_cpm = float(rows[0][3] or 0) if include_revenue and rows and len(rows[0]) > 3 else 0.0
+    monetized_playbacks = int(rows[0][4] or 0) if include_revenue and rows and len(rows[0]) > 4 else 0
 
     # 使用货币化播放次数计算 RPM（更准确）
     rpm = round((revenue / monetized_playbacks * 1000), 2) if monetized_playbacks > 0 else 0.0
@@ -307,7 +400,9 @@ def upsert_registry(registry_path: Path, row: Dict) -> None:
 def get_registry(registry_path: Path) -> pd.DataFrame:
     registry = read_table(registry_path)
     if registry.empty:
-        return pd.DataFrame(columns=["updated_at", "alias", "channel_title", "channel_id", "custom_url", "token_file", "status"])
+        return pd.DataFrame(columns=["updated_at", "alias", "channel_title", "channel_id", "custom_url", "token_file", "scope_profile", "status"])
+    if "scope_profile" not in registry.columns:
+        registry["scope_profile"] = DEFAULT_SCOPE_PROFILE
     return registry
 
 
@@ -335,10 +430,18 @@ def save_authorized_channel(
     alias: Optional[str],
     force_reauth: bool,
     port: int,
+    scope_profile: Optional[str] = None,
 ) -> Dict:
     token_dir.mkdir(parents=True, exist_ok=True)
     temp_token = token_dir / "_pending_auth.pickle"
-    creds = load_credentials(client_secrets, temp_token, force_reauth=True if force_reauth else temp_token.exists(), port=port)
+    scope_profile = normalize_scope_profile(scope_profile)
+    creds = load_credentials(
+        client_secrets,
+        temp_token,
+        force_reauth=True if force_reauth else temp_token.exists(),
+        port=port,
+        scope_profile=scope_profile,
+    )
     youtube, _ = build_clients(creds)
     channel = get_current_channel(youtube)
 
@@ -356,6 +459,7 @@ def save_authorized_channel(
         "channel_id": channel["channel_id"],
         "custom_url": channel["custom_url"],
         "token_file": str(token_file),
+        "scope_profile": scope_profile,
         "status": "已授权",
     }
     upsert_registry(registry_path, row)
@@ -363,14 +467,37 @@ def save_authorized_channel(
 
 
 def collect_one_channel(client_secrets: Path, token_file: Path) -> Dict:
-    creds = load_credentials(client_secrets, token_file, force_reauth=False, port=8765)
-    youtube, analytics = build_clients(creds)
-    channel = get_current_channel(youtube)
+    channel = {"channel_id": "", "channel_title": "", "custom_url": "", "subscriber_count": 0, "video_count": 0, "total_view_count": 0}
 
-    # 重试3次
-    for attempt in range(3):
+    try:
+        creds = load_credentials(client_secrets, token_file, force_reauth=False, port=8765)
+        youtube, analytics = build_clients(creds)
+        channel = get_current_channel(youtube)
+    except Exception as e:
+        # 如果获取频道信息失败，返回错误
+        return {
+            "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            **channel,
+            "period_start": "",
+            "period_end": "",
+            "views_28d": 0,
+            "watch_hours_28d": 0.0,
+            "estimated_revenue_28d_usd": 0.0,
+            "estimated_revenue_total_usd": 0.0,
+            "playback_based_cpm_28d_usd": 0.0,
+            "rpm_28d_usd": 0.0,
+            "views_48h": 0,
+            "token_file": str(token_file),
+            "status": "授权错误",
+            "error": repr(e)[:200],
+        }
+
+    error_msg = ""
+    include_revenue = has_scope(creds, REVENUE_SCOPE)
+    # 重试5次（包括SSL错误）
+    for attempt in range(5):
         try:
-            summary = get_analytics_summary(analytics)
+            summary = get_analytics_summary(analytics, include_revenue=include_revenue)
             views_48h = get_views_48h(analytics)
             return {
                 "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -379,18 +506,21 @@ def collect_one_channel(client_secrets: Path, token_file: Path) -> Dict:
                 "views_48h": views_48h,
                 "token_file": str(token_file),
                 "status": "成功",
-                "error": "",
+                "error": "" if include_revenue else "Token is missing revenue scope; revenue fields were skipped.",
             }
         except HttpError as e:
             status_code = e.resp.status if hasattr(e, 'resp') else 0
-            # 403是权限问题，不重试
+            # 403是权限问题，可能是：未开通货币化/频道被终止/权限被撤销
             if status_code == 403:
-                error_msg = "未开通货币化"
+                error_msg = "权限问题(403)"
                 break
             # 500/503是服务器错误，重试
             if status_code in [500, 503] and attempt < 2:
                 continue
             error_msg = f"API错误{status_code}"
+            break
+        except Exception as e:
+            error_msg = repr(e)[:100]
             break
 
     # 返回基本信息
@@ -407,13 +537,12 @@ def collect_one_channel(client_secrets: Path, token_file: Path) -> Dict:
         "rpm_28d_usd": 0.0,
         "views_48h": 0,
         "token_file": str(token_file),
-        "status": error_msg,
-        "error": str(status_code),
+        "status": error_msg or "错误",
+        "error": str(error_msg),
     }
 
 
 def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: Path, output_path: Path, progress_callback=None) -> pd.DataFrame:
-    rows: List[Dict] = []
     registry = get_registry(registry_path)
 
     if registry.empty:
@@ -424,10 +553,11 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
     token_files = [Path(value) for value in active_registry["token_file"].tolist() if str(value).strip()]
     total = len(token_files)
 
-    for idx, token_file in enumerate(token_files, 1):
-        if progress_callback:
-            progress_callback(idx, total)
+    # 并行采集配置
+    max_workers = 5  # 同时采集5个频道
 
+    def collect_single(token_file: Path) -> Dict:
+        """采集单个频道"""
         # 从注册表获取频道基本信息
         channel_info = active_registry[active_registry["token_file"] == str(token_file)]
         channel_title = channel_info["channel_title"].iloc[0] if not channel_info.empty else ""
@@ -435,50 +565,67 @@ def collect_all_channels(client_secrets: Path, token_dir: Path, registry_path: P
         alias = channel_info["alias"].iloc[0] if not channel_info.empty else ""
 
         if token_file.name.startswith("_pending_") or not token_file.exists():
-            rows.append(
-                {
-                    "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "channel_title": channel_title,
-                    "channel_id": channel_id,
-                    "alias": alias,
-                    "token_file": str(token_file),
-                    "status": "令牌缺失",
-                    "error": "token file not found",
-                }
-            )
-            continue
-        try:
-            rows.append(collect_one_channel(client_secrets, token_file))
-        except HttpError as exc:
-            rows.append(
-                {
-                    "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "channel_title": channel_title,
-                    "channel_id": channel_id,
-                    "alias": alias,
-                    "token_file": str(token_file),
-                    "status": "http_error",
-                    "error": exc.content.decode("utf-8", errors="ignore"),
-                }
-            )
-        except Exception as exc:
-            rows.append(
-                {
-                    "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "channel_title": channel_title,
-                    "channel_id": channel_id,
-                    "alias": alias,
-                    "token_file": str(token_file),
-                    "status": "错误",
-                    "error": repr(exc),
-                }
-            )
+            return {
+                "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "channel_title": channel_title,
+                "channel_id": channel_id,
+                "alias": alias,
+                "token_file": str(token_file),
+                "status": "令牌缺失",
+                "error": "token file not found",
+            }
 
-    result = pd.DataFrame(rows)
-    if not result.empty:
-        result = result.sort_values(by=["status", "channel_title"], ascending=[True, True])
-    write_table(output_path, make_public_report(result))
-    return result
+        try:
+            result = collect_one_channel(client_secrets, token_file)
+            # 如果返回结果中没有频道信息，用注册表的数据补充
+            if not result.get("channel_title") and channel_title:
+                result["channel_title"] = channel_title
+            if not result.get("channel_id") and channel_id:
+                result["channel_id"] = channel_id
+            if not result.get("alias") and alias:
+                result["alias"] = alias
+            return result
+        except HttpError as exc:
+            return {
+                "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "channel_title": channel_title,
+                "channel_id": channel_id,
+                "alias": alias,
+                "token_file": str(token_file),
+                "status": "http_error",
+                "error": exc.content.decode("utf-8", errors="ignore"),
+            }
+        except Exception as exc:
+            return {
+                "capture_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "channel_title": channel_title,
+                "channel_id": channel_id,
+                "alias": alias,
+                "token_file": str(token_file),
+                "status": "错误",
+                "error": repr(exc),
+            }
+
+    # 并行采集
+    rows: List[Dict] = []
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_token = {executor.submit(collect_single, tf): tf for tf in token_files}
+
+        for future in as_completed(future_to_token):
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total)
+
+            result = future.result()
+            rows.append(result)
+
+    result_df = pd.DataFrame(rows)
+    if not result_df.empty:
+        result_df = result_df.sort_values(by=["status", "channel_title"], ascending=[True, True])
+    write_table(output_path, make_public_report(result_df))
+    return result_df
 
 
 def disable_channel(registry_path: Path, identifier: str, move_token: bool, inactive_dir: Path) -> Dict:

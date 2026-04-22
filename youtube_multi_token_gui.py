@@ -29,6 +29,11 @@ class YouTubeManagerApp:
         self.root.geometry("1120x720")
         self.root.minsize(980, 620)
 
+        # 显示启动提示
+        self.loading_label = ttk.Label(root, text="正在加载频道列表...", font=("微软雅黑", 14))
+        self.loading_label.pack(expand=True)
+        root.update()
+
         defaults = get_default_paths()
         # 如果是打包后的程序，显示友好的路径名称
         if getattr(sys, 'frozen', False):
@@ -41,7 +46,8 @@ class YouTubeManagerApp:
             self.registry_var = tk.StringVar(value=str(defaults["registry"]))
         self.output_var = tk.StringVar(value=str(defaults["desktop_output"]))
         self.alias_var = tk.StringVar()
-        self.port_var = tk.StringVar(value="8768")
+        self.port_var = tk.StringVar(value="9000")
+        self.scope_profile_var = tk.StringVar(value="revenue")
         self.status_var = tk.StringVar(value="就绪")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *args: self.filter_channels())
@@ -52,7 +58,10 @@ class YouTubeManagerApp:
         self.progress_bar: ttk.Progressbar
 
         self._build_ui()
-        self.refresh_registry()
+        # 隐藏启动画面
+        self.loading_label.pack_forget()
+        # 后台异步加载频道列表
+        self.root.after(100, self._load_registry_background)
 
     def _build_ui(self) -> None:
         container = ttk.Frame(self.root, padding=12)
@@ -73,6 +82,14 @@ class YouTubeManagerApp:
         ttk.Entry(action_frame, textvariable=self.alias_var, width=24).grid(row=0, column=1, padx=8, pady=8, sticky="w")
         ttk.Label(action_frame, text="授权端口").grid(row=0, column=2, padx=8, pady=8, sticky="w")
         ttk.Entry(action_frame, textvariable=self.port_var, width=10).grid(row=0, column=3, padx=8, pady=8, sticky="w")
+        ttk.Label(action_frame, text="Scope").grid(row=2, column=0, padx=8, pady=8, sticky="w")
+        ttk.Combobox(
+            action_frame,
+            textvariable=self.scope_profile_var,
+            values=("basic", "revenue"),
+            width=12,
+            state="readonly",
+        ).grid(row=2, column=1, padx=8, pady=8, sticky="w")
 
         ttk.Button(action_frame, text="授权当前频道", command=self.authorize_channel).grid(row=0, column=4, padx=8, pady=8)
         ttk.Button(action_frame, text="刷新频道列表", command=self.refresh_registry).grid(row=0, column=5, padx=8, pady=8)
@@ -80,9 +97,9 @@ class YouTubeManagerApp:
         ttk.Button(action_frame, text="生成中文报表", command=self.export_chinese).grid(row=0, column=7, padx=8, pady=8)
 
         ttk.Button(action_frame, text="删除选中频道", command=self.disable_selected).grid(row=1, column=4, padx=8, pady=8)
-        ttk.Button(action_frame, text="清空所有频道", command=self.clear_all_channels).grid(row=1, column=5, padx=8, pady=8)
-        ttk.Button(action_frame, text="打开输出文件", command=self.open_output).grid(row=1, column=6, padx=8, pady=8)
-        ttk.Button(action_frame, text="打开注册表", command=self.open_registry).grid(row=1, column=7, padx=8, pady=8)
+        ttk.Button(action_frame, text="导出授权名单", command=self.export_registry).grid(row=1, column=5, padx=8, pady=8)
+        ttk.Button(action_frame, text="清空所有频道", command=self.clear_all_channels).grid(row=1, column=6, padx=8, pady=8)
+        ttk.Button(action_frame, text="打开输出文件", command=self.open_output).grid(row=1, column=7, padx=8, pady=8)
 
         # 搜索框放在操作和列表之间
         search_frame = ttk.Frame(container)
@@ -132,6 +149,23 @@ class YouTubeManagerApp:
         ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
         self.progress_bar = ttk.Progressbar(bottom, mode="determinate", length=300)
         self.progress_bar.pack(side="right", padx=(10, 0))
+
+    def _load_registry_background(self) -> None:
+        """后台异步加载频道列表"""
+        try:
+            self.full_registry = list_channels(self._get_path_or_default(self.registry_var, "registry"))
+            self.root.after(0, self._update_tree_with_registry)
+        except Exception as exc:
+            self.root.after(0, lambda: self.log(f"读取注册表失败：{exc}"))
+
+    def _update_tree_with_registry(self) -> None:
+        """在UI线程更新频道列表"""
+        if self.full_registry.empty:
+            self.log("当前还没有已授权频道。")
+            return
+
+        self.filter_channels()
+        self.log(f"已加载 {len(self.full_registry)} 个频道。")
 
     def _add_path_row(
         self,
@@ -192,7 +226,7 @@ class YouTubeManagerApp:
     def authorize_channel(self) -> None:
         def job() -> None:
             alias = self.alias_var.get().strip() or None
-            port = int(self.port_var.get().strip() or "8768")
+            port = int(self.port_var.get().strip() or "9000")
             row = save_authorized_channel(
                 client_secrets=self._get_path_or_default(self.client_secrets_var, "client_secrets"),
                 token_dir=self._get_path_or_default(self.token_dir_var, "token_dir"),
@@ -200,6 +234,7 @@ class YouTubeManagerApp:
                 alias=alias,
                 force_reauth=True,
                 port=port,
+                scope_profile=self.scope_profile_var.get().strip() or "revenue",
             )
             self.root.after(0, self.refresh_registry)
             self.root.after(0, lambda: self.log(f"授权成功：{row['channel_title']}"))
@@ -398,6 +433,29 @@ class YouTubeManagerApp:
             messagebox.showwarning("提示", "注册表还不存在。")
             return
         webbrowser.open(path.as_uri())
+
+    def export_registry(self) -> None:
+        """导出授权名单到Excel"""
+        from datetime import datetime
+        from youtube_multi_token_manager import get_registry
+
+        registry = get_registry(self._get_path_or_default(self.registry_var, "registry"))
+        if registry.empty:
+            messagebox.showwarning("提示", "没有已授权的频道。")
+            return
+
+        # 导出到桌面
+        desktop = Path.home() / "Desktop"
+        filename = f"授权名单_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        output_path = desktop / filename
+
+        # 只导出关键列
+        export_data = registry[["channel_title", "channel_id", "alias", "status", "updated_at"]].copy()
+        export_data.columns = ["频道名称", "频道ID", "别名", "状态", "更新时间"]
+        export_data.to_excel(str(output_path), index=False)
+
+        self.log(f"授权名单已导出：{output_path}")
+        messagebox.showinfo("完成", f"已导出 {len(export_data)} 个频道到：\n{output_path}")
 
 
 def main() -> None:
